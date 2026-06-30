@@ -443,7 +443,7 @@ def run_bot_polling() -> None:
     )
 
     print("[telegram_bot] Starting polling (long-lived process)...")
-    _bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    _bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 def check_approval_status(task_id: str) -> str | None:
