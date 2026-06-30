@@ -404,6 +404,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ── setup ───────────────────────────────────────────────────
 
 
+async def _error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.error("Exception while handling an update: %s", context.error)
+
 def setup_bot_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("generate", cmd_generate))
@@ -412,6 +417,7 @@ def setup_bot_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(handle_platform_callback, pattern="^generate_now$"))
     application.add_handler(CallbackQueryHandler(handle_approval_response, pattern="^(approve|reject|edit)$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_error_handler(_error_handler)
     print("[telegram_bot] All handlers registered")
 
 
@@ -425,8 +431,15 @@ def run_bot_polling() -> None:
 
     _bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     setup_bot_handlers(_bot_app)
+
+    import logging
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.WARNING,
+    )
+
     print("[telegram_bot] Starting polling (long-lived process)...")
-    _bot_app.run_polling()
+    _bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 def check_approval_status(task_id: str) -> str | None:
