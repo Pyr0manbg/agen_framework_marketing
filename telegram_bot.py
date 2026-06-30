@@ -429,6 +429,10 @@ def run_bot_polling() -> None:
         print("[telegram_bot] No TELEGRAM_BOT_TOKEN set — cannot start polling.")
         return
 
+    import time
+    print("[telegram_bot] Waiting 5s before connecting to Telegram...")
+    time.sleep(5)
+
     _bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     setup_bot_handlers(_bot_app)
 
@@ -439,7 +443,7 @@ def run_bot_polling() -> None:
     )
 
     print("[telegram_bot] Starting polling (long-lived process)...")
-    _bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    _bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 def check_approval_status(task_id: str) -> str | None:
