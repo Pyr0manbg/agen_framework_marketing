@@ -16,8 +16,12 @@ from config import (
     GOOGLE_API_KEY,
     GEMINI_IMAGE_MODEL,
     HF_TOKEN,
+    OPENAI_API_KEY,
     POLLINATIONS_BASE_URL,
 )
+
+# Lazy-loaded SD pipeline (loaded once, reused globally)
+_sd_pipeline = None
 
 MEDIA_DIR = Path(__file__).resolve().parent / "generated_media"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
@@ -236,13 +240,197 @@ def _try_pollinations(prompt: str, width: int, height: int) -> str | None:
     return None
 
 
+# ── OpenAI (DALL-E 3 / gpt-image-1) ──────────────────────────
+
+
+def generate_image_openai(prompt: str, save_local: bool = True) -> str:
+    """Generate an image via OpenAI gpt-image-1.
+
+    Uses the REST API directly (not the SDK) for compatibility with the
+    gpt-image-1 model which uses b64_json response format.
+
+    Args:
+        prompt: Text description of the desired image.
+        save_local: If True, saves the image to generated_media/.
+
+    Returns:
+        Local file path of the generated (and watermarked) image.
+
+    Raises:
+        RuntimeError: If the API call fails or no key is configured.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    model = "gpt-image-1"
+    size = "1024x1024"
+
+    print(f"[openai] Calling {model} (size={size})...")
+    t0 = time.time()
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={"model": model, "prompt": prompt, "n": 1, "size": size},
+            timeout=120,
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError("OpenAI request timed out (120s)")
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(f"OpenAI connection error: {e}")
+
+    if resp.status_code == 400:
+        err_data = resp.json()
+        msg = (err_data.get("error") or {}).get("message", "")
+        m = msg.lower()
+        if "content_policy" in m or "safety" in m or "content_filter" in m:
+            raise RuntimeError(f"OpenAI content policy violation: {msg}")
+        raise RuntimeError(f"OpenAI API error (400): {msg}")
+    if resp.status_code == 401:
+        raise RuntimeError("OpenAI invalid API key (401)")
+    if resp.status_code == 429:
+        raise RuntimeError("OpenAI rate limited (429)")
+    if resp.status_code == 402:
+        raise RuntimeError("OpenAI insufficient credits (402)")
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI HTTP {resp.status_code}: {resp.text[:300]}")
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"OpenAI HTTP error: {e}")
+
+    elapsed = time.time() - t0
+    body = resp.json()
+    image_data = body.get("data", [{}])[0]
+    b64_json = image_data.get("b64_json")
+
+    if not b64_json:
+        raise RuntimeError("OpenAI returned no b64_json in response")
+
+    import base64
+    image_bytes = base64.b64decode(b64_json)
+
+    print(f"[openai] ✅ Image generated in {elapsed:.1f}s")
+
+    result = _save_image_bytes(image_bytes, prompt)
+    return result
+
+
+# ── Local Stable Diffusion 1.5 ───────────────────────────────
+
+
+def generate_image_local_sd(prompt: str, save_local: bool = True) -> str:
+    """Generate an image using local Stable Diffusion v1.5 via diffusers.
+
+    Uses torch.float16, model CPU offload, and attention slicing to fit
+    within 4 GB VRAM (RTX 3050). The model is loaded lazily on first call
+    and cached globally for subsequent calls.
+
+    Args:
+        prompt: Text description of the desired image.
+        save_local: If True, saves the image to generated_media/.
+
+    Returns:
+        Local file path of the generated (and watermarked) image.
+
+    Raises:
+        RuntimeError: If generation fails or CUDA is unavailable.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for local SD generation")
+
+    global _sd_pipeline
+
+    if _sd_pipeline is None:
+        from diffusers import StableDiffusionPipeline
+
+        print("[local-sd] Loading Stable Diffusion v1.5 pipeline (first call, downloading if needed)...")
+        t0 = time.time()
+
+        model_id = "runwayml/stable-diffusion-v1-5"
+        hf_key = HF_TOKEN or os.environ.get("HF_TOKEN", "")
+
+        try:
+            _sd_pipeline = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16,
+                safety_checker=None,
+                token=hf_key or None,
+            )
+        except OSError as e:
+            err = str(e).lower()
+            if "gated" in err or "access" in err:
+                print(f"[local-sd] {model_id} is gated, trying dreamshaper-8...")
+                _sd_pipeline = StableDiffusionPipeline.from_pretrained(
+                    "Lykon/dreamshaper-8",
+                    torch_dtype=torch.float16,
+                    safety_checker=None,
+                )
+            else:
+                print(f"[local-sd] Failed to load {model_id}: {e}")
+                print(f"[local-sd] Trying dreamshaper-8 as fallback...")
+                _sd_pipeline = StableDiffusionPipeline.from_pretrained(
+                    "Lykon/dreamshaper-8",
+                    torch_dtype=torch.float16,
+                    safety_checker=None,
+                )
+
+        _sd_pipeline.enable_model_cpu_offload()
+        _sd_pipeline.enable_attention_slicing()
+        print(f"[local-sd] Pipeline loaded in {time.time() - t0:.1f}s")
+
+    output_dir = _ensure_media_dir()
+    safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in prompt)[:40]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"local_sd_{ts}_{safe.strip('_')}.png"
+    out_path = str((output_dir / filename).resolve())
+
+    print(f"[local-sd] Generating image (25 steps)...")
+    t0 = time.time()
+
+    try:
+        image = _sd_pipeline(
+            prompt,
+            num_inference_steps=25,
+            height=512,
+            width=512,
+        ).images[0]
+    except torch.cuda.OutOfMemoryError:
+        print("[local-sd] CUDA out of memory — clearing cache and retrying with 20 steps...")
+        torch.cuda.empty_cache()
+        try:
+            image = _sd_pipeline(
+                prompt,
+                num_inference_steps=20,
+                height=512,
+                width=512,
+            ).images[0]
+        except torch.cuda.OutOfMemoryError as e:
+            raise RuntimeError(f"CUDA OOM even after retry: {e}")
+
+    elapsed = time.time() - t0
+    print(f"[local-sd] Image generated in {elapsed:.1f}s")
+
+    if save_local:
+        image.save(out_path, "PNG")
+        add_logo_watermark(out_path)
+        print(f"[local-sd] Saved to {out_path}")
+    return out_path
+
+
+# ── Main generation with fallback ────────────────────────────
+
+
 def generate_image(
     prompt: str,
     width: int = 1024,
     height: int = 1024,
     save_local: bool = True,
 ) -> str:
-    """Generate an image with three-tier fallback: HuggingFace → Gemini → Pollinations.
+    """Generate an image with five-tier fallback: OpenAI → Gemini → HF → Pollinations → local SD.
 
     Args:
         prompt: Text description of the desired image.
@@ -255,28 +443,53 @@ def generate_image(
 
     Raises:
         ValueError: If save_local=False.
-        RuntimeError: If all three providers fail.
+        RuntimeError: If all providers fail.
     """
     if not save_local:
         raise ValueError("Image generation requires save_local=True")
 
-    # Tier 1: Hugging Face FLUX.1-dev
-    result = _try_huggingface(prompt)
-    if result:
-        return result
+    # Tier 1: OpenAI DALL-E 3
+    if OPENAI_API_KEY:
+        print("[generate_image] Trying OpenAI DALL-E 3...")
+        try:
+            result = generate_image_openai(prompt, save_local)
+            if result:
+                return result
+        except RuntimeError as e:
+            print(f"[generate_image] OpenAI failed: {e}")
+    else:
+        print("[generate_image] OPENAI_API_KEY not set, skipping OpenAI")
 
     # Tier 2: Gemini Nano Banana
     result = _try_gemini(prompt)
     if result:
         return result
 
-    # Tier 3: Pollinations
+    # Tier 3: Hugging Face FLUX.1-dev
+    result = _try_huggingface(prompt)
+    if result:
+        return result
+
+    # Tier 4: Pollinations
     result = _try_pollinations(prompt, width, height)
     if result:
         return result
 
+    # Tier 5: Local Stable Diffusion 1.5 (no quotas, always works)
+    import torch
+    if torch.cuda.is_available():
+        print("[generate_image] Falling back to local SD 1.5...")
+        try:
+            result = generate_image_local_sd(prompt, save_local)
+            if result:
+                return result
+        except Exception as e:
+            print(f"[generate_image] Local SD also failed: {e}")
+    else:
+        print("[generate_image] CUDA not available, skipping local SD fallback")
+
     raise RuntimeError(
-        "All image providers failed (HuggingFace → Gemini → Pollinations)"
+        "All image providers failed (OpenAI → Gemini → HuggingFace → Pollinations → local SD)"
     )
 
 
@@ -424,6 +637,84 @@ def test_media_generation() -> None:
 
     print("\n" + "=" * 60)
     print("test_media_generation() COMPLETE")
+    print("=" * 60)
+
+
+def test_local_sd() -> None:
+    """Test ONLY the local SD generator directly, not through fallback chain."""
+    print("=" * 60)
+    print("test_local_sd() — Local Stable Diffusion 1.5")
+    print("=" * 60)
+
+    prompt = (
+        "modern Bulgarian accounting office, two professionals at desks "
+        "with monitors, teal and amber color accents, "
+        "shot on Canon EOS R5, 35mm lens, natural window lighting, photorealistic"
+    )
+
+    print(f"\nPrompt: {prompt}")
+    print("Loading SD 1.5 and generating (first run downloads ~4 GB)...\n")
+
+    t_start = time.time()
+    try:
+        result_path = generate_image_local_sd(prompt=prompt, save_local=True)
+    except (RuntimeError, ImportError) as e:
+        print(f"\n  ✗ Failed: {type(e).__name__}: {e}")
+        return
+
+    total = time.time() - t_start
+    path_obj = Path(result_path)
+    if path_obj.exists():
+        size_kb = path_obj.stat().st_size / 1024
+        print(f"\n  ✓ File saved: {result_path}")
+        print(f"  ✓ File size: {size_kb:.1f} KB")
+        print(f"  ✓ Total time: {total:.1f}s")
+        print(f"  ✓ Generation time: {total:.1f}s (includes model loading on first run)")
+    else:
+        print(f"\n  ✗ File not found at: {result_path}")
+
+    print("\n" + "=" * 60)
+    print("test_local_sd() COMPLETE")
+    print("=" * 60)
+
+
+def test_openai_image() -> None:
+    """Test ONLY the OpenAI image generator directly, not through fallback chain."""
+    print("=" * 60)
+    print("test_openai_image() — OpenAI gpt-image-1")
+    print("=" * 60)
+
+    prompt = (
+        "modern Bulgarian accounting office, two professionals at desks "
+        "with monitors, teal and amber color accents, "
+        "shot on Canon EOS R5, 35mm lens, natural window lighting, photorealistic"
+    )
+
+    print(f"\nPrompt: {prompt}")
+    if not OPENAI_API_KEY:
+        print("\n  ✗ OPENAI_API_KEY not set in .env")
+        print("  Add it and try again.")
+        return
+
+    t_start = time.time()
+    try:
+        result_path = generate_image_openai(prompt=prompt, save_local=True)
+    except RuntimeError as e:
+        print(f"\n  ✗ Failed: {e}")
+        return
+
+    total = time.time() - t_start
+    path_obj = Path(result_path)
+    if path_obj.exists():
+        size_kb = path_obj.stat().st_size / 1024
+        print(f"\n  ✓ File saved: {result_path}")
+        print(f"  ✓ File size: {size_kb:.1f} KB")
+        print(f"  ✓ Total time: {total:.1f}s")
+    else:
+        print(f"\n  ✗ File not found at: {result_path}")
+
+    print("\n" + "=" * 60)
+    print("test_openai_image() COMPLETE")
     print("=" * 60)
 
 
